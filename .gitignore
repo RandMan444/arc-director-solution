@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# Run artefacts: checkpoints, logs, evaluation dumps.
+runs/
+
+# Mined coverage reports are cheap to regenerate and large.
+data/reachable*.json
+
+# ARC data is copied in from C:\ARC-AGI and C:\ARC-AGI-2 by hand.
+data/arc1/
+data/arc2/

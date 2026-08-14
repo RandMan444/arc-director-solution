@@ -1,0 +1,62 @@
+# Tiny end-to-end check: two rungs, small nets, a few thousand steps.
+# Used by tests and by scripts/smoke.py. Not a research configuration.
+
+run_dir: runs/smoke
+seed: 0
+device: cpu
+
+curriculum:
+  ladder:
+    - name: w0_geometry_1
+      kind: warmup
+      groups: [geometry]
+      n_ops: [1]
+      min_side: 4
+      max_side: 6
+      n_demos: 2
+      max_steps: 4
+      promote_at: 0.8
+      promote_window: 50
+      min_episodes: 100
+    - name: w1_geometry_2
+      kind: warmup
+      groups: [geometry, color]
+      n_ops: [1, 2]
+      min_side: 4
+      max_side: 6
+      n_demos: 3
+      max_steps: 6
+      promote_at: 1.01
+      min_episodes: 1000000000
+  auto_promote: true
+  arc_root: data/arc2
+
+env:
+  max_demos: 3
+  min_visible_demos: 2
+  max_steps: 6
+  augment: true
+
+agent:
+  grid_side: 6
+  grid_channels: [8, 16, 16]
+  grid_dim: 32
+  d_model: 48
+  set_layers: 1
+  set_heads: 2
+  state_dim: 48
+  lstm_dim: 64
+  mem_len: 8
+  mem_dim: 32
+  mem_heads: 2
+  manager_every: 3
+  goal_groups: 4
+  goal_codes: 4
+  goal_hidden: 64
+
+train:
+  n_envs: 4
+  n_steps: 8
+  total_steps: 2000
+  log_every: 5
+  checkpoint_every: 0

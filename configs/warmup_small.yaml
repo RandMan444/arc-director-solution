@@ -1,0 +1,75 @@
+# Warm-up only: the five generated-program rungs, no ARC.
+#
+# Everything is sized to run on a CPU at a useful speed. grid_side=12 is the
+# key one: the ladder never generates a grid wider than 12, and encoder cost
+# scales with the square of it. Nothing about grid_side changes a parameter
+# shape, so this checkpoint loads straight into configs/full.yaml at 30.
+
+run_dir: runs/warmup_small
+seed: 0
+device: auto
+
+curriculum:
+  # The warm-up rungs only; the ARC rungs need grid_side 30.
+  ladder: warmup
+  start_stage: 0
+  auto_promote: true
+  arc_root: data/arc2
+  arc_split: training
+
+env:
+  max_demos: 3
+  min_visible_demos: 2
+  holdout_demo: true
+  include_test_ctx: true
+  max_steps: 12
+  augment: true
+  step_cost: 0.02
+  error_penalty: 0.10
+  shaping_scale: 2.0
+  solve_bonus: 5.0
+  # Pays for the slack left on the clock when a program solves the task, which
+  # is what makes HALT worth emitting. Without it, stopping early and running to
+  # the horizon pay the same, so the halt rate drifts and the agent ends up
+  # trying to land on the answer at the last step instead of committing to it.
+  length_bonus: 1.0
+
+agent:
+  grid_side: 12
+  grid_channels: [16, 32, 32]
+  grid_dim: 64
+  d_model: 128
+  set_layers: 2
+  state_dim: 128
+  lstm_dim: 256
+  use_memory: true
+  # Matches configs/full.yaml so the checkpoint transfers; the positional
+  # encoding buffer is shape-bearing, so this cannot differ between the two.
+  mem_len: 24
+  # Short warm-up episodes: a manager that acted every 4 steps would make a
+  # single decision per episode and get almost no credit signal.
+  manager_every: 2
+  manager_grads_to_trunk: false
+  goal_groups: 8
+  goal_codes: 8
+
+train:
+  n_envs: 16
+  n_steps: 32
+  total_steps: 3000000
+  lr: 0.0003
+  gamma: 0.99
+  gae_lambda: 0.95
+  worker_goal_reward: delta
+  worker_goal_weight: 1.0
+  worker_extrinsic_weight: 1.0
+  worker_bootstrap_across_goals: true
+  # Held higher for longer than a standard A2C schedule. This action space has
+  # ~60 legal operators per step, and a premature entropy collapse locks the
+  # policy onto one of them for good.
+  worker_entropy_coef: 0.03
+  worker_entropy_final: 0.010
+  worker_entropy_anneal_steps: 2000000
+  manager_exploration_weight: 0.1
+  log_every: 10
+  checkpoint_every: 200

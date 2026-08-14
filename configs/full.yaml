@@ -1,0 +1,81 @@
+# The whole ladder: five generated rungs, then real ARC.
+#
+# grid_side is 30 because the ARC rungs show full-size grids, which makes the
+# grid encoder roughly six times more expensive than the warm-up config. Start
+# from a warmup_small checkpoint (scripts/train.py --resume) rather than paying
+# for the early rungs at full resolution.
+
+run_dir: runs/full
+seed: 0
+device: auto
+
+curriculum:
+  ladder: default
+  start_stage: 0
+  auto_promote: true
+  # A list is allowed. ARC-1 training is a legitimate extra pool -- ARC-2's
+  # training set already overlaps it heavily -- and it roughly doubles the
+  # number of tasks the coverage search can certify. Evaluation splits must
+  # never go here.
+  arc_root: [data/arc2, data/arc1]
+  arc_split: training
+  # Written by scripts/mine_reachable.py. Without it the a0_arc_reachable rung
+  # has no task pool and the run refuses to start -- deliberately, because
+  # jumping straight to unfiltered ARC is what made the previous project's
+  # results unreadable.
+  reachable_file: data/reachable.json
+  # Held out of every training pool, chosen deterministically by task id.
+  # scripts/evaluate.py measures the public evaluation split separately.
+  dev_holdout: 100
+
+env:
+  max_demos: 4
+  min_visible_demos: 2
+  holdout_demo: true
+  include_test_ctx: true
+  max_steps: 16
+  augment: true
+  step_cost: 0.02
+  error_penalty: 0.10
+  shaping_scale: 2.0
+  solve_bonus: 5.0
+
+agent:
+  # Every field except grid_side matches configs/warmup_small.yaml, and that is
+  # deliberate: grid_side only controls how much of the padded grid the encoder
+  # looks at, so it changes no parameter shape and a warm-up checkpoint loads
+  # straight in. Widening the network here would break --resume; if you want a
+  # bigger net for ARC, widen both files and redo the warm-up.
+  grid_side: 30
+  grid_channels: [16, 32, 32]
+  grid_dim: 64
+  d_model: 128
+  set_layers: 2
+  set_heads: 4
+  state_dim: 128
+  lstm_dim: 256
+  use_memory: true
+  mem_len: 24
+  manager_every: 4
+  manager_grads_to_trunk: false
+  goal_groups: 8
+  goal_codes: 8
+
+train:
+  n_envs: 32
+  n_steps: 32
+  total_steps: 100000000
+  lr: 0.0003
+  gamma: 0.995
+  gae_lambda: 0.95
+  worker_goal_weight: 1.0
+  worker_extrinsic_weight: 0.2
+  worker_entropy_coef: 0.02
+  worker_entropy_final: 0.004
+  worker_entropy_anneal_steps: 5000000
+  manager_exploration_weight: 0.1
+  log_every: 20
+  checkpoint_every: 500
+  eval_every: 2000
+  eval_attempts: 8
+  eval_tasks: 40

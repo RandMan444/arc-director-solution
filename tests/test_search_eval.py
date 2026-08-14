@@ -103,6 +103,25 @@ def test_evaluation_summary_shape(spec, agent):
     assert all(r.attempts == 4 for r in results)
 
 
+def test_evaluation_reports_arc1_and_arc2_separately(spec, agent):
+    first = rotate_task(3)
+    first.source = "arc1"
+    second = identity_task()
+    second.source = "arc2"
+    summary, results = evaluate_tasks(
+        agent,
+        spec,
+        [first, second],
+        EnvConfig(max_demos=3, max_steps=4, augment=True),
+        torch.device("cpu"),
+        n_attempts=2,
+        seed=4,
+    )
+    assert summary["arc1/tasks"] == 1
+    assert summary["arc2/tasks"] == 1
+    assert {result.source for result in results} == {"arc1", "arc2"}
+
+
 def test_evaluation_leaves_the_agent_in_training_mode(spec, agent):
     agent.train()
     evaluate_tasks(

@@ -58,8 +58,20 @@ def main() -> None:
         made = generate_tasks(args.limit or 100, spec, GenConfig(n_ops=2), seed=args.seed)
         tasks = [m.task for m in made]
     else:
-        root = args.arc_root or cfg["curriculum"]["arc_root"]
-        tasks = load_arc_tasks(root, args.split)
+        root_value = args.arc_root or cfg["curriculum"]["arc_root"]
+        roots = (
+            [part.strip() for part in root_value.split(",")]
+            if isinstance(root_value, str)
+            else list(root_value)
+        )
+        tasks, seen = [], set()
+        for root in roots:
+            source = Path(root).name.lower() or "arc"
+            for task in load_arc_tasks(root, args.split, source=source):
+                key = (task.source, task.task_id)
+                if key not in seen:
+                    seen.add(key)
+                    tasks.append(task)
         if args.limit:
             tasks = tasks[: args.limit]
 

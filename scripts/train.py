@@ -10,16 +10,18 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Sequence
 
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from arc_director.config import build, load_config  # noqa: E402
+from arc_director.dashboard import DashboardServer  # noqa: E402
 from arc_director.utils.seed import set_seed  # noqa: E402
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--run-dir", default=None, help="override the config's run_dir")
@@ -27,7 +29,17 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=None, help="override total env steps")
     parser.add_argument("--device", default=None)
     parser.add_argument("--threads", type=int, default=None, help="torch CPU threads")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=None,
+        help="serve a live dashboard on this port (0 chooses a free port)",
+    )
+    parser.add_argument("--dashboard-title", default="ARC Director")
+    parser.add_argument("--dashboard-phase", default="Training")
+    parser.add_argument("--dashboard-phase-index", type=int, default=1)
+    parser.add_argument("--dashboard-phase-total", type=int, default=1)
+    args = parser.parse_args(argv)
 
     if args.threads:
         torch.set_num_threads(args.threads)
@@ -52,14 +64,38 @@ def main() -> None:
         trainer.load(Path(args.resume))
         print(f"resumed from {args.resume} at update {trainer.updates}")
 
+    dashboard = DashboardServer(
+        trainer.run_dir,
+        args.dashboard_title,
+        port=args.dashboard_port,
+        phase=args.dashboard_phase,
+        phase_index=args.dashboard_phase_index,
+        phase_total=args.dashboard_phase_total,
+    )
+    status = "finished"
+    exit_code = 0
     try:
+        dashboard.update(status="training")
         trainer.train(args.steps)
     except KeyboardInterrupt:
+        status = "interrupted"
+        exit_code = 130
         print("\ninterrupted; saving")
+    except BaseException:
+        status = "failed"
+        raise
     finally:
         trainer.save(trainer.run_dir / "checkpoint.pt")
+        dashboard.update(
+            status=status,
+            checkpoint=str(trainer.run_dir / "checkpoint.pt"),
+            env_steps=trainer.env_steps,
+            updates=trainer.updates,
+        )
+        dashboard.close()
         print(f"saved to {trainer.run_dir / 'checkpoint.pt'}")
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

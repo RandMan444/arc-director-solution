@@ -263,6 +263,7 @@ def test_dev_holdout_is_disjoint_and_deterministic(tmp_path):
     pool_ids = {t.task_id for t in env.source.inner.tasks}
     assert len(dev_ids) == 100
     assert not (dev_ids & pool_ids)
+    assert {t.source for t in trainer.dev_tasks[:40]} == {"arc1", "arc2"}
 
     _, _, _, again = build(cfg, run_dir=str(tmp_path / "b"))
     assert {t.task_id for t in again.dev_tasks} == dev_ids

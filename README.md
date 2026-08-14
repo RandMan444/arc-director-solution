@@ -45,7 +45,17 @@ pip install -e .[dev]
 pytest -q
 ```
 
-The current suite is 89 tests over the machine, the operators, the environment,
+On Windows, the repository also includes an idempotent setup script:
+
+```powershell
+.\scripts\setup.ps1
+```
+
+It creates `.venv`, installs CUDA PyTorch and the project, verifies the GPU,
+and runs the correctness suite. Use `-CudaWheel cpu` for a CPU-only smoke-test
+environment.
+
+The current suite is 97 tests over the machine, the operators, the environment,
 the networks, the trainer and the evaluation protocol. It runs on CPU in about
 ten seconds.
 
@@ -63,6 +73,36 @@ that are otherwise invisible:
 ---
 
 ## Run
+
+### Launch button (recommended)
+
+Open **Run and Debug** in VS Code and choose one of the included buttons:
+
+- **ARC Director - START (generated programs -> ARC-1 + ARC-2)** starts a new
+  run and refuses to overwrite an existing checkpoint.
+- **ARC Director - RESUME** continues whichever checkpoint is furthest along.
+- **ARC Director - SMOKE TEST + DASHBOARD** runs a short CPU-friendly pipeline
+  check.
+
+The start button deliberately runs two compatible phases. It first learns from
+self-generated DSL programs on small grids, then transfers that checkpoint to
+the full curriculum over ARC-1 and ARC-2. Before the ARC phase it reuses local
+dataset copies when available (including `C:\arc-2-solution\data`), otherwise
+it downloads the official datasets, and mines the certified reachable subset.
+The one-time reachability search is CPU-heavy.
+
+Each training phase opens the live dashboard at
+`http://127.0.0.1:8321/`. The dashboard reads the durable
+`train_log.jsonl`, so the charts and the raw record cannot disagree. Watch
+held-out generalization for promotion, ARC dev exactness/pass@N for real-task
+progress, and top-operator share for policy collapse.
+
+The same pipeline is available without VS Code:
+
+```bash
+python scripts/run_launch.py --fresh
+python scripts/run_launch.py --resume
+```
 
 ```bash
 # Warm-up only: generated tasks, small grids, CPU-runnable.

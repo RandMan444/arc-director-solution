@@ -1,0 +1,59 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "ARC Director - START (generated programs -> ARC-1 + ARC-2)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/run_launch.py",
+      "cwd": "${workspaceFolder}",
+      "args": ["--fresh"],
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "serverReadyAction": {
+        "pattern": "\\[dashboard\\] (http://\\S+)",
+        "uriFormat": "%s",
+        "action": "openExternally"
+      },
+      "env": {"PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1"}
+    },
+    {
+      "name": "ARC Director - RESUME",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/run_launch.py",
+      "cwd": "${workspaceFolder}",
+      "args": ["--resume"],
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "serverReadyAction": {
+        "pattern": "\\[dashboard\\] (http://\\S+)",
+        "uriFormat": "%s",
+        "action": "openExternally"
+      },
+      "env": {"PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1"}
+    },
+    {
+      "name": "ARC Director - SMOKE TEST + DASHBOARD",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/train.py",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "--config", "configs/smoke.yaml",
+        "--run-dir", "runs/smoke_button",
+        "--steps", "256",
+        "--dashboard-port", "8321",
+        "--dashboard-phase", "Smoke test"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "serverReadyAction": {
+        "pattern": "\\[dashboard\\] (http://\\S+)",
+        "uriFormat": "%s",
+        "action": "openExternally"
+      },
+      "env": {"PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1"}
+    }
+  ]
+}

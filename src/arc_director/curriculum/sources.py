@@ -112,12 +112,16 @@ class WarmupSource(TaskSource):
 # ---------------------------------------------------------------------------
 
 
-def load_arc_tasks(root: str | Path, split: str = "training") -> List[ArcTask]:
+def load_arc_tasks(
+    root: str | Path, split: str = "training", *, source: Optional[str] = None
+) -> List[ArcTask]:
     """Load every task in ``<root>/<split>``."""
-    directory = Path(root) / split
+    root = Path(root)
+    directory = root / split
     if not directory.is_dir():
         raise FileNotFoundError(f"no ARC split at {directory}")
-    return [ArcTask.from_file(p, source=split) for p in sorted(directory.glob("*.json"))]
+    label = source or root.name or split
+    return [ArcTask.from_file(p, source=label) for p in sorted(directory.glob("*.json"))]
 
 
 def filter_arc_tasks(
@@ -325,8 +329,12 @@ class CurriculumSource(TaskSource):
         out.update(
             stage=self.stage.name,
             stage_index=self.index,
+            stage_total=len(self.stages),
             stage_episodes=self.episodes_in_stage,
             stage_rate=round(self.rate, 4),
+            stage_target=self.stage.promote_at,
+            stage_min_episodes=self.stage.min_episodes,
+            stage_window=self.stage.promote_window,
             total_episodes=self.total_episodes,
         )
         return out

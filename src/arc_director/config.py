@@ -159,10 +159,14 @@ def build(
     roots = cur["arc_root"]
     roots = [roots] if isinstance(roots, str) else list(roots)
     arc_tasks: List = []
+    tasks_by_source: List[Tuple[str, List]] = []
     if needs_arc:
         seen = set()
         for root in roots:
-            for task in load_arc_tasks(root, cur["arc_split"]):
+            source_name = Path(root).name.lower() or "arc"
+            loaded = load_arc_tasks(root, cur["arc_split"], source=source_name)
+            tasks_by_source.append((source_name, loaded))
+            for task in loaded:
                 if task.task_id in seen:
                     continue
                 seen.add(task.task_id)
@@ -176,11 +180,30 @@ def build(
     dev_tasks: List = []
     n_dev = int(cur.get("dev_holdout", 0) or 0)
     if needs_arc and n_dev:
-        ordered = sorted(arc_tasks, key=lambda t: t.task_id)
-        stride = max(1, len(ordered) // n_dev)
-        held = {id(t) for t in ordered[::stride][:n_dev]}
-        dev_tasks = [t for t in arc_tasks if id(t) in held]
-        arc_tasks = [t for t in arc_tasks if id(t) not in held]
+        # Allocate the dev budget across dataset roots, then interleave the
+        # selections.  Periodic evaluation commonly takes only a prefix, so a
+        # concatenated ARC-2/ARC-1 list would silently report just one source.
+        n_sources = len(tasks_by_source)
+        selected_by_source: List[List] = []
+        reserved_ids = set()
+        for source_index, (_source, source_tasks) in enumerate(tasks_by_source):
+            quota = n_dev // n_sources + int(source_index < n_dev % n_sources)
+            ordered = sorted(
+                (task for task in source_tasks if task.task_id not in reserved_ids),
+                key=lambda task: task.task_id,
+            )
+            stride = max(1, len(ordered) // max(1, quota))
+            selected = ordered[::stride][:quota]
+            selected_by_source.append(selected)
+            reserved_ids.update(task.task_id for task in selected)
+        for row in range(max(map(len, selected_by_source), default=0)):
+            for selected in selected_by_source:
+                if row < len(selected):
+                    dev_tasks.append(selected[row])
+        # If an ARC-1 task also occurs in ARC-2, holding it out for either
+        # source removes it from the de-duplicated training pool entirely.
+        held_ids = {task.task_id for task in dev_tasks}
+        arc_tasks = [task for task in arc_tasks if task.task_id not in held_ids]
     source = CurriculumSource(
         spec,
         stages,

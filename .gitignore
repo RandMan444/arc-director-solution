@@ -3,6 +3,7 @@ __pycache__/
 *.egg-info/
 .venv/
 .pytest_cache/
+.test-tmp/
 
 # Run artefacts: checkpoints, logs, evaluation dumps.
 runs/
@@ -13,3 +14,5 @@ data/reachable*.json
 # ARC data is copied in from C:\ARC-AGI and C:\ARC-AGI-2 by hand.
 data/arc1/
 data/arc2/
+data/.download/
+data/dataset_revisions.json

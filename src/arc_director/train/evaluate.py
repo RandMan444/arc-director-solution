@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+import re
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -62,6 +63,7 @@ class SingleTaskSource:
 @dataclass
 class TaskResult:
     task_id: str
+    source: str
     attempts: int
     demo_fit: int                 # attempts exact on every demonstration
     exact_at_1: bool
@@ -73,6 +75,7 @@ class TaskResult:
     def as_dict(self) -> dict:
         return {
             "task_id": self.task_id,
+            "source": self.source,
             "attempts": self.attempts,
             "demo_fit": self.demo_fit,
             "exact_at_1": self.exact_at_1,
@@ -183,6 +186,7 @@ def _run_attempts(
 
     return TaskResult(
         task_id=task.task_id,
+        source=task.source,
         attempts=len(attempts),
         demo_fit=len(fitting),
         exact_at_1=exact_1,
@@ -223,13 +227,26 @@ def evaluate_tasks(
     if was_training:
         agent.train()
 
-    n = max(1, len(results))
-    summary = {
-        "tasks": len(results),
-        "demo_fit_rate": sum(r.demo_fit > 0 for r in results) / n,
-        "exact_at_1": sum(r.exact_at_1 for r in results) / n,
-        "exact_at_2": sum(r.exact_at_2 for r in results) / n,
-        "pass_at_n": sum(r.pass_at_n for r in results) / n,
-        "n_attempts": n_attempts,
-    }
+    def rates(items: Sequence[TaskResult]) -> Dict[str, float]:
+        n = max(1, len(items))
+        return {
+            "tasks": len(items),
+            "demo_fit_rate": sum(r.demo_fit > 0 for r in items) / n,
+            "exact_at_1": sum(r.exact_at_1 for r in items) / n,
+            "exact_at_2": sum(r.exact_at_2 for r in items) / n,
+            "pass_at_n": sum(r.pass_at_n for r in items) / n,
+        }
+
+    summary = {**rates(results), "n_attempts": n_attempts}
+    sources = sorted({result.source for result in results if result.source})
+    for source in sources:
+        key = re.sub(r"[^a-z0-9]+", "_", source.lower()).strip("_") or "arc"
+        summary.update(
+            {
+                f"{key}/{metric}": value
+                for metric, value in rates(
+                    [result for result in results if result.source == source]
+                ).items()
+            }
+        )
     return summary, results

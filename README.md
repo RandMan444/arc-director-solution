@@ -55,7 +55,7 @@ It creates `.venv`, installs CUDA PyTorch and the project, verifies the GPU,
 and runs the correctness suite. Use `-CudaWheel cpu` for a CPU-only smoke-test
 environment.
 
-The current suite is 97 tests over the machine, the operators, the environment,
+The current suite is 105 tests over the machine, the operators, the environment,
 the networks, the trainer and the evaluation protocol. It runs on CPU in about
 ten seconds.
 
@@ -115,14 +115,13 @@ python scripts/show_warmup.py --stage w3_objects --n 3
 # Find the ARC tasks the action space provably covers (writes data/reachable.json).
 python scripts/mine_reachable.py --out data/reachable.json --budget 6
 
-# The full ladder, warm-up through ARC. Resume from a warm-up checkpoint:
-# grid_side changes no parameter shapes, so a 12x12-trained encoder loads at 30.
-python scripts/train.py --config configs/full.yaml \
-    --resume runs/warmup_small/checkpoint.pt
+# Start a clean strict-Director pipeline. Old hybrid checkpoints remain under
+# runs/warmup_small and runs/full for diagnosis and are never overwritten.
+python scripts/run_launch.py --fresh
 
 # Evaluate under the ARC protocol (2 attempts, demonstrations-only selection).
 python scripts/evaluate.py --config configs/full.yaml \
-    --checkpoint runs/full/checkpoint.pt --split evaluation --attempts 16
+    --checkpoint runs/director_proper/checkpoint.pt --split evaluation --attempts 16
 ```
 
 Training prints one line per `log_every` updates and appends the full record to
@@ -141,6 +140,19 @@ policy is collapsing onto one action, which is the failure mode to watch for.
 Both are measured at training temperature with an entropy bonus in force, so
 they read well below what the policy does greedily — see the temperature table
 below. `scripts/inspect_run.py <run_dir>` prints the whole curve.
+
+The shipped warm-up and ARC configs also enable crossed epiplexity duels. One
+fork pairs a low-temperature Director with a high-temperature worker and the
+other reverses the pairing. Each critic measures its value-loss improvement on
+the same transitions and fixed targets before and after every A2C update; those
+deltas are summed over four updates. Director and worker winners are selected
+independently and recombined, with the worker owning the shared visual trunk.
+The dashboard reports both AUC comparisons and cumulative exploration win rates.
+
+The configs enforce the Director-proper contract: one latent per DSL action,
+worker reward equal to latent progress only, and task reward visible only to
+the Director. Clean runs write to `runs/director_proper_warmup` and
+`runs/director_proper`; earlier hybrid checkpoints are preserved.
 
 Run the ablation alongside anything you train:
 
@@ -276,13 +288,12 @@ each one failed in a way that looks like "the model just isn't learning":
 1. Director's absolute goal reward pays the worker to stand still and penalises
    it for stopping — the halt rate went to zero and the solve rate sat at the
    random baseline for 300k steps.
-2. A worker paid task reward cannot have its horizon truncated at goal
-   boundaries; the solve bonus lands on the last step and nothing earlier ever
-   sees it. This one peaked at 0.63 and then collapsed to the random baseline,
-   twice, at the same point.
+2. The earlier hybrid leaked task reward into the worker and crossed Director
+   goal boundaries. That experiment is retained as history; the active strict
+   Director gives the worker no task reward at all.
 3. Squared value loss on returns that jump an order of magnitude the moment the
    agent starts succeeding sends that gradient through the shared trunk.
 
-Deliberately deferred: epiplexity dueling (see `DESIGN.md` §6 for where it
-attaches and what the manager/worker split makes possible), and a general
-`FOREACH` block, which is the largest remaining expressivity gap.
+Crossed Director/worker epiplexity dueling is now implemented at that split.
+Still deliberately deferred is a general `FOREACH` block, which is the largest
+remaining expressivity gap.

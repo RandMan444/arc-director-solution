@@ -5,7 +5,7 @@
 # from a warmup_small checkpoint (scripts/train.py --resume) rather than paying
 # for the early rungs at full resolution.
 
-run_dir: runs/full
+run_dir: runs/director_proper
 seed: 0
 device: auto
 
@@ -56,8 +56,10 @@ agent:
   lstm_dim: 256
   use_memory: true
   mem_len: 24
-  manager_every: 4
+  # One Director instruction per DSL statement.
+  manager_every: 1
   manager_grads_to_trunk: false
+  worker_env_feedback: false
   goal_groups: 8
   goal_codes: 8
 
@@ -69,11 +71,22 @@ train:
   gamma: 0.995
   gae_lambda: 0.95
   worker_goal_weight: 1.0
-  worker_extrinsic_weight: 0.2
+  # Director proper: ARC reward trains only the Director. The worker optimizes
+  # only whether its next state follows the Director's latent instruction.
+  worker_extrinsic_weight: 0.0
+  worker_bootstrap_across_goals: false
+  director_proper: true
   worker_entropy_coef: 0.02
   worker_entropy_final: 0.004
   worker_entropy_anneal_steps: 5000000
   manager_exploration_weight: 0.1
+  # Independent crossed duels keep either half of the hierarchy from forcing
+  # the other's exploration choice. The worker owns the shared visual trunk;
+  # the Director owns only its manager recurrence and heads.
+  epiplexity_duel: true
+  epiplexity_duel_updates: 4
+  epiplexity_low_temperature: 0.75
+  epiplexity_high_temperature: 1.50
   log_every: 20
   checkpoint_every: 500
   eval_every: 2000

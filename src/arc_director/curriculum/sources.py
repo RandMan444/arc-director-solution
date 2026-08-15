@@ -54,10 +54,11 @@ class TaskSource:
 class WarmupSource(TaskSource):
     """Generates a fresh task per episode from the machine itself.
 
-    Generation is cheap (milliseconds) and never repeats, so there is nothing
-    to memorise -- the only way to score is to read the demonstrations. A small
-    cache absorbs the occasional run of rejected candidates without stalling
-    the rollout.
+    Generation is cheap and never repeats, so there is nothing to memorise --
+    the only way to score is to read the demonstrations. Candidate filtering
+    is deliberately strict and long programs can have a yield near one per
+    hundred attempts, so the retry budget must tolerate long random rejection
+    streaks while remaining finite for a genuinely invalid custom stage.
     """
 
     def __init__(
@@ -69,8 +70,12 @@ class WarmupSource(TaskSource):
         n_ops_choices: Sequence[int] = (1,),
         max_steps: Optional[int] = None,
         name: str = "warmup",
-        max_tries: int = 50,
+        max_tries: int = 5_000,
     ) -> None:
+        if not n_ops_choices:
+            raise ValueError("WarmupSource requires at least one program length")
+        if max_tries < 1:
+            raise ValueError("WarmupSource.max_tries must be positive")
         self.spec = spec
         self.cfg = cfg
         self.allowed_ops = allowed_ops
@@ -80,6 +85,8 @@ class WarmupSource(TaskSource):
         self.max_tries = max_tries
         self.generated = 0
         self.rejected = 0
+        self.rejection_streak = 0
+        self.max_rejection_streak = 0
         self.last_program: Optional[str] = None
 
     def sample(self, rng: np.random.Generator) -> ArcTask:
@@ -88,14 +95,19 @@ class WarmupSource(TaskSource):
             made = generate_task(rng, self.spec, self.cfg, self.allowed_ops)
             if made is None:
                 self.rejected += 1
+                self.rejection_streak += 1
+                self.max_rejection_streak = max(
+                    self.max_rejection_streak, self.rejection_streak
+                )
                 continue
             self.generated += 1
+            self.rejection_streak = 0
             self.last_program = made.program
             made.task.task_id = f"{self.name}_{self.generated:07d}"
             return made.task
         raise RuntimeError(
-            f"{self.name}: no task generated in {self.max_tries} tries; the operator "
-            "subset is probably too small for the requested program length"
+            f"{self.name}: no task generated after {self.max_tries} candidate "
+            "rejections; the custom stage's operator/length combination may be invalid"
         )
 
     def stats(self) -> Dict[str, object]:
@@ -104,6 +116,7 @@ class WarmupSource(TaskSource):
             "source": self.name,
             "generated": self.generated,
             "reject_rate": round(self.rejected / total, 3) if total else 0.0,
+            "max_rejection_streak": self.max_rejection_streak,
         }
 
 
@@ -340,11 +353,24 @@ class CurriculumSource(TaskSource):
         return out
 
     def state_dict(self) -> Dict[str, object]:
+        inner: Dict[str, object] = {}
+        if isinstance(self.inner, WarmupSource):
+            inner = {
+                "generated": self.inner.generated,
+                "rejected": self.inner.rejected,
+                "rejection_streak": self.inner.rejection_streak,
+                "max_rejection_streak": self.inner.max_rejection_streak,
+                "last_program": self.inner.last_program,
+            }
+        elif isinstance(self.inner, ArcSource):
+            inner = {"solved_ids": sorted(self.inner.solved_ids)}
         return {
             "index": self.index,
             "episodes_in_stage": self.episodes_in_stage,
             "total_episodes": self.total_episodes,
-            "history": self.history,
+            "recent": list(self.recent),
+            "history": list(self.history),
+            "inner": inner,
         }
 
     def load_state_dict(self, state: Dict[str, object]) -> None:
@@ -353,3 +379,15 @@ class CurriculumSource(TaskSource):
         self._build()
         self.episodes_in_stage = int(state.get("episodes_in_stage", 0))
         self.total_episodes = int(state.get("total_episodes", 0))
+        self.recent.extend(float(value) for value in state.get("recent", []))
+        inner = state.get("inner", {})
+        if not isinstance(inner, dict):
+            inner = {}
+        if isinstance(self.inner, WarmupSource):
+            self.inner.generated = int(inner.get("generated", 0))
+            self.inner.rejected = int(inner.get("rejected", 0))
+            self.inner.rejection_streak = int(inner.get("rejection_streak", 0))
+            self.inner.max_rejection_streak = int(inner.get("max_rejection_streak", 0))
+            self.inner.last_program = inner.get("last_program")
+        elif isinstance(self.inner, ArcSource):
+            self.inner.solved_ids = set(inner.get("solved_ids", []))

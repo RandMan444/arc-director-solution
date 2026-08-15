@@ -1,7 +1,8 @@
 """Start or resume a Director run.
 
     python scripts/train.py --config configs/warmup_small.yaml
-    python scripts/train.py --config configs/full.yaml --resume runs/warmup_small/checkpoint.pt
+    python scripts/train.py --config configs/full.yaml \
+        --resume runs/director_proper_warmup/checkpoint.pt
 """
 
 from __future__ import annotations

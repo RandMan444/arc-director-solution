@@ -83,6 +83,10 @@ class AgentConfig:
 
     manager_every: int = 4
     manager_grads_to_trunk: bool = False
+    #: Whether the worker is told the previous environment reward/error.  In
+    #: Director-proper mode this is False: the manager sees task feedback and
+    #: the worker sees only state plus the manager's latent goal.
+    worker_env_feedback: bool = True
 
 
 @dataclass
@@ -349,6 +353,8 @@ class DirectorAgent(nn.Module):
         manager_action: Optional[torch.Tensor] = None,
         state_vec: Optional[torch.Tensor] = None,
         temperature: float = 1.0,
+        worker_temperature: Optional[float] = None,
+        manager_temperature: Optional[float] = None,
     ) -> StepOutput:
         """Run manager (when due) and worker for one environment step.
 
@@ -362,10 +368,20 @@ class DirectorAgent(nn.Module):
         state_vec:
             A trunk output computed in one batched pass over a whole rollout,
             so the Python loop here carries only the recurrent parts.
+        temperature:
+            Backwards-compatible common sampling temperature.  The two
+            component temperatures below override it when supplied, which is
+            what lets epiplexity duel crossed Director/worker treatments.
         """
         s = self.trunk(obs) if state_vec is None else state_vec
         batch = s.shape[0]
         cfg = self.cfg
+        worker_temperature = float(
+            temperature if worker_temperature is None else worker_temperature
+        )
+        manager_temperature = float(
+            temperature if manager_temperature is None else manager_temperature
+        )
 
         # -- manager, at the abstract time scale ----------------------
         due = (state.since_goal % cfg.manager_every == 0)
@@ -377,7 +393,9 @@ class DirectorAgent(nn.Module):
         manager_c = keep * mc + (1 - keep) * state.manager_c
 
         code_logits = self.manager_head(manager_h).view(batch, cfg.goal_groups, cfg.goal_codes)
-        code_dist = torch.distributions.Categorical(logits=code_logits / temperature)
+        code_dist = torch.distributions.Categorical(
+            logits=code_logits / manager_temperature
+        )
         codes = manager_action if manager_action is not None else code_dist.sample()
         manager_logp = code_dist.log_prob(codes).sum(-1)
         manager_entropy = code_dist.entropy().sum(-1)
@@ -400,11 +418,14 @@ class DirectorAgent(nn.Module):
             [self.op_emb(last[:, 0]), self.arg_emb(last[:, 1:]).sum(dim=1)], dim=-1
         )
         progress = (state.since_goal % cfg.manager_every).float() / cfg.manager_every
+        worker_feedback = (
+            feedback if cfg.worker_env_feedback else torch.zeros_like(feedback)
+        )
         parts = [
             s,
             goal.detach(),  # the goal is a target, not something the worker shapes
             prev_action,
-            feedback,
+            worker_feedback,
             progress.unsqueeze(-1),
         ]
         if self.memory_attention is not None:
@@ -412,7 +433,11 @@ class DirectorAgent(nn.Module):
         wh, wc = self.worker_lstm(torch.cat(parts, dim=-1), (state.worker_h, state.worker_c))
 
         op, args, logp, entropy = self.actor(
-            wh, obs["op_mask"], obs["arg_mask"], actions=actions, temperature=temperature
+            wh,
+            obs["op_mask"],
+            obs["arg_mask"],
+            actions=actions,
+            temperature=worker_temperature,
         )
         worker_value = self.worker_value(wh).squeeze(-1)
 

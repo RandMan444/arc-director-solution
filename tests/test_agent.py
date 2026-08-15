@@ -79,6 +79,31 @@ def test_reevaluating_an_action_reproduces_its_logprob(spec, agent):
     assert torch.allclose(sampled.manager_logp, replayed.manager_logp, atol=1e-5)
 
 
+def test_director_proper_worker_does_not_observe_environment_reward(spec):
+    cfg = AgentConfig(
+        grid_side=6, grid_channels=(8, 16, 16), grid_dim=32, d_model=48,
+        set_layers=1, set_heads=2, state_dim=48, lstm_dim=64,
+        mem_len=8, mem_dim=32, mem_heads=2, goal_groups=4, goal_codes=4,
+        goal_hidden=64, manager_every=1, worker_env_feedback=False,
+    )
+    torch.manual_seed(7)
+    proper = DirectorAgent(cfg, spec)
+    _, obs = make_obs(spec)
+    state = proper.initial_state(4, torch.device("cpu"))
+    codes = torch.zeros(4, cfg.goal_groups, dtype=torch.long)
+    actions = (torch.zeros(4, dtype=torch.long), torch.zeros(4, spec.max_arity, dtype=torch.long))
+    with torch.no_grad():
+        zero = proper.step(
+            obs, state, torch.zeros(4, 2), actions=actions, manager_action=codes
+        )
+        noisy = proper.step(
+            obs, state, torch.randn(4, 2) * 100,
+            actions=actions, manager_action=codes,
+        )
+    assert torch.allclose(zero.worker_value, noisy.worker_value, atol=1e-6)
+    assert torch.allclose(zero.worker_logp, noisy.worker_logp, atol=1e-6)
+
+
 # -- the demonstration set -------------------------------------------------
 
 

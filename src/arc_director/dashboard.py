@@ -148,7 +148,7 @@ _PAGE = r"""<!doctype html>
 <header><h1>{{RUN}}</h1><span id="status">waiting for the first update…</span></header>
 <main>
   <section class="card wide pipeline">
-    <div><h2>Training pipeline</h2><strong id="phase">Starting</strong><div id="phaseCount" class="legend"></div></div>
+    <div><h2>Training pipeline</h2><strong id="phase">Starting</strong><div id="phaseCount" class="legend"></div><div id="contract" class="legend">Waiting for hierarchy contract.</div></div>
     <div><h2>Current curriculum rung</h2><div class="value" id="stage">—</div>
       <p id="stageDetail">Generated DSL programs come first; ARC tasks follow after the policy earns promotion.</p>
       <div class="bar"><i id="stageBar"></i></div></div>
@@ -160,6 +160,8 @@ _PAGE = r"""<!doctype html>
   <section class="card"><h2>ARC-AGI-2 exact @ 2</h2><div class="value green" id="arc2">—</div><canvas id="arc2Chart"></canvas><div class="legend" id="arc2Detail">Waiting for held-out ARC-2 evaluation.</div></section>
   <section class="card"><h2>Episode return</h2><div class="value" id="ret">—</div><canvas id="retChart"></canvas></section>
   <section class="card"><h2>Worker entropy</h2><div class="value" id="entropy">—</div><canvas id="entropyChart"></canvas><div class="legend">A sudden fall can signal policy collapse.</div></section>
+  <section class="card"><h2>Worker epiplexity duel</h2><div class="value" id="workerDuel">—</div><canvas id="workerDuelChart"></canvas><div class="legend" id="workerDuelDetail">Waiting for a crossed duel.</div></section>
+  <section class="card"><h2>Director epiplexity duel</h2><div class="value" id="directorDuel">—</div><canvas id="directorDuelChart"></canvas><div class="legend" id="directorDuelDetail">Waiting for a crossed duel.</div></section>
   <section class="card"><h2>Top operator share</h2><div class="value" id="top">—</div><canvas id="topChart"></canvas><div class="legend" id="topName">No action data yet.</div></section>
   <section class="card"><h2>Goal progress reward</h2><div class="value" id="goal">—</div><canvas id="goalChart"></canvas></section>
   <section class="card"><h2>Total loss</h2><div class="value" id="loss">—</div><canvas id="lossChart"></canvas></section>
@@ -188,16 +190,20 @@ async function refresh(){
   $('phase').textContent=meta.phase||'Training';$('phaseCount').textContent=(meta.phase_total||1)>1?'Phase '+meta.phase_index+' of '+meta.phase_total:'';
   if(!train.length){$('status').textContent=meta.status||'waiting for the first update…';return}
   const r=train[train.length-1],e=evals[evals.length-1];
+  $('contract').textContent=r['hierarchy/director_proper']?'Director proper · one latent every '+Number(r['hierarchy/director_every']||1)+' action · worker task-reward weight '+num(r['hierarchy/worker_task_weight'],1):'Hybrid hierarchy';
   $('status').textContent='update '+r.update+' · '+Number(r.env_steps||0).toLocaleString()+' steps · '+num(r.sps,0)+' steps/s';
   $('stage').textContent=r['env/stage']||'—';const rate=Number(r['env/stage_rate']||0),target=Number(r['env/stage_target']||0),episodes=Number(r['env/stage_episodes']||0),minimum=Number(r['env/stage_min_episodes']||0);
   $('stageDetail').textContent='rung '+(Number(r['env/stage_index']||0)+1)+' of '+Number(r['env/stage_total']||1)+' · '+episodes.toLocaleString()+' / '+minimum.toLocaleString()+' episodes · generalization '+pct(rate)+' / '+pct(target);
   $('stageBar').style.width=Math.max(0,Math.min(100,target?rate*100/target:0))+'%';
   $('gen').textContent=pct(r.generalize_rate);$('solve').textContent=pct(r.solve_rate);$('ret').textContent=num(r.mean_return,2);
   $('entropy').textContent=num(r['policy/worker_entropy'],3);$('top').textContent=pct(r['actions/top_op_share']);
+  $('workerDuel').textContent=r['epiplexity/worker_winner']||'off';$('directorDuel').textContent=r['epiplexity/director_winner']||'off';
+  $('workerDuelDetail').textContent='AUC explore '+num(r['epiplexity/worker_explore_auc'],5)+' · exploit '+num(r['epiplexity/worker_exploit_auc'],5)+' · explore win rate '+pct(r['epiplexity/worker_explore_win_rate']);
+  $('directorDuelDetail').textContent='AUC explore '+num(r['epiplexity/director_explore_auc'],5)+' · exploit '+num(r['epiplexity/director_exploit_auc'],5)+' · explore win rate '+pct(r['epiplexity/director_explore_win_rate']);
   $('topName').textContent=(r['actions/top_op']||'—')+' · '+(Number(r['actions/distinct_ops']||0))+' distinct operators in the rollout';
   $('goal').textContent=num(r['reward/goal_mean'],4);$('loss').textContent=num(r['loss/total'],4);
   $('throughput').innerHTML=num(r.sps,0)+' <small>environment steps / second</small>';
-  $('generated').textContent=Number.isFinite(Number(r['env/generated']))?Number(r['env/generated']).toLocaleString()+' self-generated tasks · rejection rate '+pct(r['env/reject_rate'])+' · '+Number(r.episodes||0).toLocaleString()+' completed episodes':Number(r['env/pool']||0).toLocaleString()+' ARC tasks in this rung · '+Number(r['env/tasks_solved']||0).toLocaleString()+' solved during training · '+Number(r.episodes||0).toLocaleString()+' completed episodes';
+  $('generated').textContent=Number.isFinite(Number(r['env/generated']))?Number(r['env/generated']).toLocaleString()+' self-generated tasks · rejection rate '+pct(r['env/reject_rate'])+' · longest rejection streak '+Number(r['env/max_rejection_streak']||0).toLocaleString()+' · '+Number(r.episodes||0).toLocaleString()+' completed episodes':Number(r['env/pool']||0).toLocaleString()+' ARC tasks in this rung · '+Number(r['env/tasks_solved']||0).toLocaleString()+' solved during training · '+Number(r.episodes||0).toLocaleString()+' completed episodes';
   if(e){
     const attempts=e['eval/n_attempts']||'N';$('eval').textContent=pct(e['eval/exact_at_2']);$('evalDetail').textContent='demo fit '+pct(e['eval/demo_fit_rate'])+' · pass@'+attempts+' '+pct(e['eval/pass_at_n']);
     $('arc1').textContent=pct(e['eval/arc1/exact_at_2']);$('arc1Detail').textContent=Number(e['eval/arc1/tasks']||0)+' tasks · demo fit '+pct(e['eval/arc1/demo_fit_rate'])+' · pass@'+attempts+' '+pct(e['eval/arc1/pass_at_n']);
@@ -206,6 +212,7 @@ async function refresh(){
   chart('genChart',train,'generalize_rate','#43d18b',true,true);chart('solveChart',train,'solve_rate','#58a6ff',true,true);
   chart('evalChart',evals,'eval/exact_at_2','#43d18b',true,true);chart('arc1Chart',evals,'eval/arc1/exact_at_2','#58a6ff',true,true);chart('arc2Chart',evals,'eval/arc2/exact_at_2','#43d18b',true,true);chart('retChart',train,'mean_return','#ffbd66');
   chart('entropyChart',train,'policy/worker_entropy','#ba9cff',true);chart('topChart',train,'actions/top_op_share','#ff6b7a',true,true);
+  chart('workerDuelChart',train,'epiplexity/worker_explore_win_rate','#58a6ff',true,true);chart('directorDuelChart',train,'epiplexity/director_explore_win_rate','#ba9cff',true,true);
   chart('goalChart',train,'reward/goal_mean','#58a6ff');chart('lossChart',train,'loss/total','#ffbd66');
 }
 refresh();setInterval(refresh,2000);window.addEventListener('resize',refresh);

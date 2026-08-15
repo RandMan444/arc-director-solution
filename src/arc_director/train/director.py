@@ -32,12 +32,14 @@ goal boundary and bootstraps there.
 
 from __future__ import annotations
 
+import copy
 import json
+import random
 import time
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -46,11 +48,18 @@ import torch.nn.functional as F
 
 from ..dsl.machine import MachineSpec
 from ..env.vec import VecProgramEnv
-from ..models.agent import DirectorAgent
+from ..models.agent import AgentState, DirectorAgent
 from ..models.goal import max_cosine
 from .rollout import RolloutBuffer, to_tensors
 
-__all__ = ["TrainConfig", "DirectorTrainer"]
+__all__ = ["TrainConfig", "DirectorTrainer", "epiplexity_auc"]
+
+_MANAGER_PREFIXES = (
+    "manager_lstm.",
+    "manager_head.",
+    "manager_value_extr.",
+    "manager_value_expl.",
+)
 
 
 @dataclass
@@ -116,6 +125,24 @@ class TrainConfig:
     # goal autoencoder
     goal_ae_coef: float = 1.0
 
+    #: Enforce the one-step Director contract rather than silently allowing a
+    #: hybrid hierarchy: the manager acts each step, the worker receives no
+    #: environment reward, and worker credit ends when the next goal arrives.
+    director_proper: bool = False
+
+    # epiplexity population training
+    #: Run two crossed treatments from the same snapshot:
+    #:   low-temperature Director + high-temperature worker
+    #:   high-temperature Director + low-temperature worker
+    #: The two critics duel independently and their winning parameter slices
+    #: are recombined.  Each score is the sum of same-target value-loss
+    #: reductions over ``epiplexity_duel_updates`` -- the A2C EPN notebook's
+    #: per-episode list/AUC semantics.
+    epiplexity_duel: bool = False
+    epiplexity_duel_updates: int = 4
+    epiplexity_low_temperature: float = 0.75
+    epiplexity_high_temperature: float = 1.50
+
     # bookkeeping
     log_every: int = 10
     checkpoint_every: int = 200
@@ -128,6 +155,16 @@ class TrainConfig:
     seed: int = 0
     device: str = "auto"
     run_dir: str = "runs/dev"
+
+    def __post_init__(self) -> None:
+        if self.epiplexity_duel_updates < 1:
+            raise ValueError("epiplexity_duel_updates must be >= 1")
+        if self.epiplexity_low_temperature <= 0:
+            raise ValueError("epiplexity_low_temperature must be positive")
+        if self.epiplexity_high_temperature <= self.epiplexity_low_temperature:
+            raise ValueError(
+                "epiplexity_high_temperature must exceed epiplexity_low_temperature"
+            )
 
     def resolved_device(self) -> torch.device:
         if self.device != "auto":
@@ -174,6 +211,77 @@ def _masked_normalize(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return ((x - mean) / (var.sqrt() + 1e-6)) * mask
 
 
+def epiplexity_auc(loss_improvements: List[float]) -> float:
+    """Sum a duel episode's same-target critic improvements.
+
+    The reference A2C notebook appends ``loss_before - loss_after`` after each
+    update chunk and calls the sum of that list the episode's epiplexity/AUC.
+    Keeping this tiny operation named and tested prevents a tempting but wrong
+    replacement with the final critic loss.
+    """
+    return float(sum(loss_improvements))
+
+
+@dataclass
+class _Replay:
+    state_all: torch.Tensor
+    final_state_vec: Optional[torch.Tensor]
+    end_state: AgentState
+    boot: Optional[Any]
+    worker_logp: torch.Tensor
+    worker_ent: torch.Tensor
+    worker_v: torch.Tensor
+    manager_logp: torch.Tensor
+    manager_ent: torch.Tensor
+    manager_v_extr: torch.Tensor
+    manager_v_expl: torch.Tensor
+    goals: torch.Tensor
+
+
+@dataclass
+class _TrainerSnapshot:
+    agent: Dict[str, torch.Tensor]
+    worker_optimizer: Dict[str, Any]
+    manager_optimizer: Dict[str, Any]
+    goal_optimizer: Dict[str, Any]
+    expl_norm: Tuple[float, float, float]
+    env: Dict[str, Any]
+    obs: Dict[str, torch.Tensor]
+    state: AgentState
+    feedback: torch.Tensor
+    segment_start_state: AgentState
+    updates: int
+    env_steps: int
+    torch_rng: torch.Tensor
+    cuda_rng: Optional[List[torch.Tensor]]
+    numpy_rng: tuple
+    python_rng: object
+
+
+def _cpu_tree(value: Any) -> Any:
+    """Deep-copy nested optimizer/model state, moving tensors off the GPU."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: _cpu_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cpu_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_cpu_tree(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _copy_agent_state(
+    state: AgentState, device: Optional[torch.device] = None
+) -> AgentState:
+    return AgentState(
+        **{
+            key: value.detach().to(device or torch.device("cpu")).clone()
+            for key, value in vars(state).items()
+        }
+    )
+
+
 class DirectorTrainer:
     """Owns the environments, the agent, the optimisers and the run directory."""
 
@@ -192,15 +300,58 @@ class DirectorTrainer:
         self.device = config.resolved_device()
         self.agent = agent.to(self.device)
 
-        goal_params = list(self.agent.goal_ae.parameters())
-        goal_ids = {id(p) for p in goal_params}
-        policy_params = [p for p in self.agent.parameters() if id(p) not in goal_ids]
-        self.optimizer = torch.optim.Adam(policy_params, lr=config.lr, eps=1e-5)
+        named_params = dict(self.agent.named_parameters())
+        goal_names = {
+            name for name in named_params if name.startswith("goal_ae.")
+        }
+        manager_names = {
+            name for name in named_params if name.startswith(_MANAGER_PREFIXES)
+        }
+        self._worker_param_names = tuple(
+            name for name in named_params if name not in goal_names | manager_names
+        )
+        self._manager_param_names = tuple(
+            name for name in named_params if name in manager_names
+        )
+        self._goal_param_names = tuple(name for name in named_params if name in goal_names)
+        self._worker_params = [named_params[name] for name in self._worker_param_names]
+        self._manager_params = [named_params[name] for name in self._manager_param_names]
+        goal_params = [named_params[name] for name in self._goal_param_names]
+        if config.epiplexity_duel and self.agent.cfg.manager_grads_to_trunk:
+            raise ValueError(
+                "epiplexity_duel requires agent.manager_grads_to_trunk=false so "
+                "Director and worker winners can be recombined without shared gradients"
+            )
+        if config.director_proper:
+            violations = []
+            if self.agent.cfg.manager_every != 1:
+                violations.append("agent.manager_every must be 1")
+            if self.agent.cfg.worker_env_feedback:
+                violations.append("agent.worker_env_feedback must be false")
+            if config.worker_extrinsic_weight != 0.0:
+                violations.append("train.worker_extrinsic_weight must be 0")
+            if config.worker_goal_weight <= 0.0:
+                violations.append("train.worker_goal_weight must be positive")
+            if config.worker_bootstrap_across_goals:
+                violations.append("train.worker_bootstrap_across_goals must be false")
+            if violations:
+                raise ValueError(
+                    "director_proper contract violated: " + "; ".join(violations)
+                )
+        self.worker_optimizer = torch.optim.Adam(
+            self._worker_params, lr=config.lr, eps=1e-5
+        )
+        self.manager_optimizer = torch.optim.Adam(
+            self._manager_params, lr=config.lr, eps=1e-5
+        )
         self.goal_optimizer = torch.optim.Adam(goal_params, lr=config.goal_lr, eps=1e-5)
 
         self.expl_norm = RunningNorm()
         self.updates = 0
         self.env_steps = 0
+        self.duel_rounds = 0
+        self.worker_explore_wins = 0
+        self.director_explore_wins = 0
         self.start_time = time.time()
 
         self.run_dir = Path(config.run_dir)
@@ -222,10 +373,25 @@ class DirectorTrainer:
 
     # -- collection ------------------------------------------------------
     @torch.no_grad()
-    def collect(self) -> RolloutBuffer:
-        buffer = RolloutBuffer(device=self.device)
+    def collect(
+        self,
+        *,
+        worker_temperature: float = 1.0,
+        manager_temperature: float = 1.0,
+    ) -> RolloutBuffer:
+        buffer = RolloutBuffer(
+            device=self.device,
+            worker_temperature=float(worker_temperature),
+            manager_temperature=float(manager_temperature),
+        )
         for _ in range(self.cfg.n_steps):
-            out = self.agent.step(self._obs, self._state, self._feedback)
+            out = self.agent.step(
+                self._obs,
+                self._state,
+                self._feedback,
+                worker_temperature=worker_temperature,
+                manager_temperature=manager_temperature,
+            )
             ops = out.op.cpu().numpy()
             args = out.args.cpu().numpy()
 
@@ -324,27 +490,25 @@ class DirectorTrainer:
             targets[t] = carry
         return targets
 
-    # -- update ----------------------------------------------------------
-    def update(self, buffer: RolloutBuffer) -> Dict[str, float]:
-        cfg = self.cfg
+    def _replay_segment(
+        self,
+        buffer: RolloutBuffer,
+        start_state: AgentState,
+        *,
+        bootstrap: bool,
+    ) -> _Replay:
+        """Replay stored actions, optionally producing boundary bootstrap values."""
         t_steps = len(buffer)
         n_envs = self.env.n_envs
-
-        stacked = buffer.stacked_obs()
-        state_all = self.agent.trunk(stacked).view(t_steps, n_envs, -1)
-        with torch.no_grad():
-            final_state_vec = self.agent.trunk(buffer.final_obs)
+        state_all = self.agent.trunk(buffer.stacked_obs()).view(t_steps, n_envs, -1)
 
         ops = buffer.tensor("ops")
         args = buffer.tensor("args")
         codes = buffer.tensor("manager_codes")
         feedback = buffer.tensor("feedback")
-        active = buffer.tensor("manager_active").float()
-        rewards = buffer.reward_tensor()
         dones = buffer.done_tensor()
 
-        # -- replay the segment through the recurrent core -------------
-        state = self._segment_start_state
+        state = start_state
         worker_logp, worker_ent, worker_v = [], [], []
         manager_logp, manager_ent, manager_v_extr, manager_v_expl = [], [], [], []
         goals = []
@@ -356,6 +520,8 @@ class DirectorTrainer:
                 actions=(ops[t], args[t]),
                 manager_action=codes[t],
                 state_vec=state_all[t],
+                worker_temperature=buffer.worker_temperature,
+                manager_temperature=buffer.manager_temperature,
             )
             worker_logp.append(out.worker_logp)
             worker_ent.append(out.worker_entropy)
@@ -367,23 +533,71 @@ class DirectorTrainer:
             goals.append(out.goal)
             state = out.next_state.reset_where(dones[t])
 
-        # One extra forward on the observation the segment stopped at, purely
-        # for bootstrap values. Without it both critics would be truncated at
-        # every segment boundary, which biases them toward short horizons.
-        with torch.no_grad():
-            boot = self.agent.step(
-                buffer.final_obs, state, buffer.final_feedback, state_vec=final_state_vec
-            )
-        self._segment_start_state = state.detach()
+        final_state_vec = None
+        boot = None
+        if bootstrap:
+            # Boundary values are targets, never part of the differentiated
+            # replay.  They are computed exactly once and then held fixed for
+            # both sides of the epiplexity measurement.
+            with torch.no_grad():
+                final_state_vec = self.agent.trunk(buffer.final_obs)
+                boot = self.agent.step(
+                    buffer.final_obs,
+                    state,
+                    buffer.final_feedback,
+                    state_vec=final_state_vec,
+                    worker_temperature=buffer.worker_temperature,
+                    manager_temperature=buffer.manager_temperature,
+                )
 
-        worker_logp = torch.stack(worker_logp)
-        worker_ent = torch.stack(worker_ent)
-        worker_v = torch.stack(worker_v)
-        manager_logp = torch.stack(manager_logp)
-        manager_ent = torch.stack(manager_ent)
-        manager_v_extr = torch.stack(manager_v_extr)
-        manager_v_expl = torch.stack(manager_v_expl)
-        goals = torch.stack(goals)
+        return _Replay(
+            state_all=state_all,
+            final_state_vec=final_state_vec,
+            end_state=state,
+            boot=boot,
+            worker_logp=torch.stack(worker_logp),
+            worker_ent=torch.stack(worker_ent),
+            worker_v=torch.stack(worker_v),
+            manager_logp=torch.stack(manager_logp),
+            manager_ent=torch.stack(manager_ent),
+            manager_v_extr=torch.stack(manager_v_extr),
+            manager_v_expl=torch.stack(manager_v_expl),
+            goals=torch.stack(goals),
+        )
+
+    # -- update ----------------------------------------------------------
+    def update(
+        self, buffer: RolloutBuffer, *, measure_epiplexity: bool = False
+    ) -> Dict[str, float]:
+        cfg = self.cfg
+        t_steps = len(buffer)
+        n_envs = self.env.n_envs
+
+        segment_start = self._segment_start_state
+        replay = self._replay_segment(buffer, segment_start, bootstrap=True)
+        state_all = replay.state_all
+        final_state_vec = replay.final_state_vec
+        boot = replay.boot
+        assert final_state_vec is not None and boot is not None
+
+        ops = buffer.tensor("ops")
+        args = buffer.tensor("args")
+        codes = buffer.tensor("manager_codes")
+        feedback = buffer.tensor("feedback")
+        active = buffer.tensor("manager_active").float()
+        rewards = buffer.reward_tensor()
+        dones = buffer.done_tensor()
+
+        self._segment_start_state = replay.end_state.detach()
+
+        worker_logp = replay.worker_logp
+        worker_ent = replay.worker_ent
+        worker_v = replay.worker_v
+        manager_logp = replay.manager_logp
+        manager_ent = replay.manager_ent
+        manager_v_extr = replay.manager_v_extr
+        manager_v_expl = replay.manager_v_expl
+        goals = replay.goals
 
         # -- rewards ----------------------------------------------------
         with torch.no_grad():
@@ -461,22 +675,70 @@ class DirectorTrainer:
         )
         manager_entropy = (manager_ent * mask).sum() / denom
 
-        loss = (
+        worker_loss = (
             worker_policy
             + cfg.worker_value_coef * worker_value_loss
             - entropy_coef * worker_entropy
-            + manager_policy
+        )
+        manager_loss = (
+            manager_policy
             + cfg.manager_value_coef * manager_value_loss
             - cfg.manager_entropy_coef * manager_entropy
         )
+        loss = worker_loss + manager_loss
 
-        self.optimizer.zero_grad(set_to_none=True)
+        self.worker_optimizer.zero_grad(set_to_none=True)
+        self.manager_optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        policy_params = self._worker_params + self._manager_params
         grad_norm = nn.utils.clip_grad_norm_(
-            [p for group in self.optimizer.param_groups for p in group["params"]],
-            cfg.max_grad_norm,
+            policy_params, cfg.max_grad_norm,
         )
-        self.optimizer.step()
+
+        # The two optimizers have disjoint ownership.  Step and measure the
+        # Director first while the worker-owned trunk is unchanged; otherwise
+        # a trunk update would masquerade as Director critic learning.  Stored
+        # goal codes make the worker replay independent of the changed manager.
+        self.manager_optimizer.step()
+        manager_epi_delta = 0.0
+        if measure_epiplexity:
+            with torch.no_grad():
+                after_manager = self._replay_segment(
+                    buffer, segment_start, bootstrap=False
+                )
+                manager_after_loss = (
+                    (
+                        F.smooth_l1_loss(
+                            after_manager.manager_v_extr,
+                            extr_target,
+                            reduction="none",
+                        )
+                        * mask
+                    ).sum()
+                    / denom
+                    + (
+                        F.smooth_l1_loss(
+                            after_manager.manager_v_expl,
+                            expl_target,
+                            reduction="none",
+                        )
+                        * mask
+                    ).sum()
+                    / denom
+                )
+            manager_epi_delta = float(manager_value_loss.detach() - manager_after_loss)
+
+        self.worker_optimizer.step()
+        worker_epi_delta = 0.0
+        if measure_epiplexity:
+            with torch.no_grad():
+                after_worker = self._replay_segment(
+                    buffer, segment_start, bootstrap=False
+                )
+                worker_after_loss = F.smooth_l1_loss(
+                    after_worker.worker_v, w_ret
+                )
+            worker_epi_delta = float(worker_value_loss.detach() - worker_after_loss)
 
         # -- goal autoencoder, on detached states ----------------------
         ae_loss, ae_stats = self.agent.goal_ae.loss(state_all.detach().reshape(-1, state_all.shape[-1]))
@@ -510,10 +772,198 @@ class DirectorTrainer:
             "reward/novelty_mean": float(novelty.mean()),
             "value/worker": float(worker_v.mean().detach()),
             "value/manager_extr": float(manager_v_extr.mean().detach()),
+            "hierarchy/director_every": int(self.agent.cfg.manager_every),
+            "hierarchy/worker_task_weight": float(cfg.worker_extrinsic_weight),
+            "hierarchy/director_proper": bool(cfg.director_proper),
+            "epiplexity/worker_delta": worker_epi_delta,
+            "epiplexity/director_delta": manager_epi_delta,
         }
         stats.update(ae_stats)
         stats.update(self._action_stats(ops))
         return stats
+
+    # -- crossed epiplexity duel ----------------------------------------
+    def _snapshot(self) -> _TrainerSnapshot:
+        return _TrainerSnapshot(
+            agent=_cpu_tree(self.agent.state_dict()),
+            worker_optimizer=_cpu_tree(self.worker_optimizer.state_dict()),
+            manager_optimizer=_cpu_tree(self.manager_optimizer.state_dict()),
+            goal_optimizer=_cpu_tree(self.goal_optimizer.state_dict()),
+            expl_norm=(self.expl_norm.mean, self.expl_norm.var, self.expl_norm.count),
+            env=self.env.state_dict(),
+            obs={key: value.detach().cpu().clone() for key, value in self._obs.items()},
+            state=_copy_agent_state(self._state),
+            feedback=self._feedback.detach().cpu().clone(),
+            segment_start_state=_copy_agent_state(self._segment_start_state),
+            updates=self.updates,
+            env_steps=self.env_steps,
+            torch_rng=torch.get_rng_state().clone(),
+            cuda_rng=(
+                [state.cpu().clone() for state in torch.cuda.get_rng_state_all()]
+                if torch.cuda.is_available()
+                else None
+            ),
+            numpy_rng=copy.deepcopy(np.random.get_state()),
+            python_rng=random.getstate(),
+        )
+
+    def _restore(self, snapshot: _TrainerSnapshot) -> None:
+        self.agent.load_state_dict(snapshot.agent)
+        self.worker_optimizer.load_state_dict(snapshot.worker_optimizer)
+        self.manager_optimizer.load_state_dict(snapshot.manager_optimizer)
+        self.goal_optimizer.load_state_dict(snapshot.goal_optimizer)
+        self.expl_norm.mean, self.expl_norm.var, self.expl_norm.count = snapshot.expl_norm
+        self.env.load_state_dict(snapshot.env)
+        self._obs = {
+            key: value.to(self.device) for key, value in snapshot.obs.items()
+        }
+        self._state = _copy_agent_state(snapshot.state, self.device)
+        self._feedback = snapshot.feedback.to(self.device)
+        self._segment_start_state = _copy_agent_state(
+            snapshot.segment_start_state, self.device
+        )
+        self.updates = snapshot.updates
+        self.env_steps = snapshot.env_steps
+        torch.set_rng_state(snapshot.torch_rng)
+        if snapshot.cuda_rng is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(snapshot.cuda_rng)
+        np.random.set_state(snapshot.numpy_rng)
+        random.setstate(snapshot.python_rng)
+
+    def _reset_after_duel(self) -> None:
+        """Begin a clean episode after independently recombining two winners."""
+        obs = self.env.reset()
+        self._obs = to_tensors(obs, self.device)
+        self._state = self.agent.initial_state(self.env.n_envs, self.device)
+        self._feedback = torch.zeros(self.env.n_envs, 2, device=self.device)
+        self._segment_start_state = self.agent.initial_state(
+            self.env.n_envs, self.device
+        )
+
+    def duel_update(self) -> Tuple[Dict[str, float], List[dict]]:
+        """Run the crossed candidates and install independent component winners.
+
+        Candidate A pairs an exploitative Director with an exploratory worker;
+        candidate B reverses that pairing.  Every candidate starts with the
+        same parameters, optimizer moments, live environments and RNG streams.
+        Critic loss is measured before and after each update against the exact
+        same fixed return targets.  Those deltas form a list and their sum is
+        the component's duel-episode AUC.
+        """
+        cfg = self.cfg
+        base = self._snapshot()
+        treatments = {
+            "worker_explore": (
+                cfg.epiplexity_high_temperature,
+                cfg.epiplexity_low_temperature,
+            ),
+            "director_explore": (
+                cfg.epiplexity_low_temperature,
+                cfg.epiplexity_high_temperature,
+            ),
+        }
+        candidates: Dict[str, Dict[str, Any]] = {}
+
+        try:
+            for name, (worker_temperature, manager_temperature) in treatments.items():
+                self._restore(base)
+                worker_curve: List[float] = []
+                director_curve: List[float] = []
+                episodes: List[dict] = []
+                stats: Dict[str, Any] = {}
+                for _ in range(cfg.epiplexity_duel_updates):
+                    buffer = self.collect(
+                        worker_temperature=worker_temperature,
+                        manager_temperature=manager_temperature,
+                    )
+                    stats = self.update(buffer, measure_epiplexity=True)
+                    worker_curve.append(stats["epiplexity/worker_delta"])
+                    director_curve.append(stats["epiplexity/director_delta"])
+                    episodes.extend(buffer.finished_infos())
+                candidates[name] = {
+                    "snapshot": self._snapshot(),
+                    "stats": stats,
+                    "episodes": episodes,
+                    "worker_auc": epiplexity_auc(worker_curve),
+                    "director_auc": epiplexity_auc(director_curve),
+                }
+        except BaseException:
+            # scripts/train.py saves in its finally block. Never let Ctrl-C or
+            # a failed candidate turn that durable checkpoint into half a duel.
+            self._restore(base)
+            raise
+
+        # Ties deliberately go to the lower-temperature treatment.  A duel
+        # should demand positive evidence before paying for more randomness.
+        worker_winner = (
+            "worker_explore"
+            if candidates["worker_explore"]["worker_auc"]
+            > candidates["director_explore"]["worker_auc"]
+            else "director_explore"
+        )
+        director_winner = (
+            "director_explore"
+            if candidates["director_explore"]["director_auc"]
+            > candidates["worker_explore"]["director_auc"]
+            else "worker_explore"
+        )
+
+        worker_snapshot: _TrainerSnapshot = candidates[worker_winner]["snapshot"]
+        director_snapshot: _TrainerSnapshot = candidates[director_winner]["snapshot"]
+        self._restore(worker_snapshot)
+        named_params = dict(self.agent.named_parameters())
+        with torch.no_grad():
+            for name in self._manager_param_names:
+                named_params[name].copy_(director_snapshot.agent[name].to(self.device))
+        self.manager_optimizer.load_state_dict(director_snapshot.manager_optimizer)
+
+        # Both forks performed real environment work even though only one live
+        # environment history can continue.  Count both for budgets/SPS; the
+        # worker winner owns the continuing curriculum and goal/trunk state.
+        self.updates = base.updates + sum(
+            candidate["snapshot"].updates - base.updates
+            for candidate in candidates.values()
+        )
+        self.env_steps = base.env_steps + sum(
+            candidate["snapshot"].env_steps - base.env_steps
+            for candidate in candidates.values()
+        )
+        self.duel_rounds += 1
+        self.worker_explore_wins += int(worker_winner == "worker_explore")
+        self.director_explore_wins += int(director_winner == "director_explore")
+        self._reset_after_duel()
+
+        stats = dict(candidates[worker_winner]["stats"])
+        stats.update(
+            {
+                "epiplexity/worker_explore_auc": candidates["worker_explore"][
+                    "worker_auc"
+                ],
+                "epiplexity/worker_exploit_auc": candidates["director_explore"][
+                    "worker_auc"
+                ],
+                "epiplexity/director_explore_auc": candidates["director_explore"][
+                    "director_auc"
+                ],
+                "epiplexity/director_exploit_auc": candidates["worker_explore"][
+                    "director_auc"
+                ],
+                "epiplexity/worker_winner": (
+                    "explore" if worker_winner == "worker_explore" else "exploit"
+                ),
+                "epiplexity/director_winner": (
+                    "explore" if director_winner == "director_explore" else "exploit"
+                ),
+                "epiplexity/worker_explore_win_rate": (
+                    self.worker_explore_wins / self.duel_rounds
+                ),
+                "epiplexity/director_explore_win_rate": (
+                    self.director_explore_wins / self.duel_rounds
+                ),
+                "epiplexity/duel_round": self.duel_rounds,
+            }
+        )
+        return stats, list(candidates[worker_winner]["episodes"])
 
     def _action_stats(self, ops: torch.Tensor) -> Dict[str, float]:
         """How concentrated the operator choice is, and on what.
@@ -546,20 +996,29 @@ class DirectorTrainer:
         total = total_steps or self.cfg.total_steps
         self._segment_start_state = self.agent.initial_state(self.env.n_envs, self.device)
         while self.env_steps < total:
-            buffer = self.collect()
-            stats = self.update(buffer)
-            episodes = buffer.finished_infos()
+            before_update = self.updates
+            if self.cfg.epiplexity_duel:
+                stats, episodes = self.duel_update()
+            else:
+                buffer = self.collect()
+                stats = self.update(buffer)
+                episodes = buffer.finished_infos()
             self.episode_stats.extend(episodes)
-            if self.updates % self.cfg.log_every == 0:
+            if self._crossed_interval(before_update, self.updates, self.cfg.log_every):
                 self.log(stats, episodes)
-            if self.cfg.checkpoint_every and self.updates % self.cfg.checkpoint_every == 0:
+            if self._crossed_interval(
+                before_update, self.updates, self.cfg.checkpoint_every
+            ):
                 self.save(self.run_dir / "checkpoint.pt")
             if (
-                self.cfg.eval_every
+                self._crossed_interval(before_update, self.updates, self.cfg.eval_every)
                 and self.dev_tasks
-                and self.updates % self.cfg.eval_every == 0
             ):
                 self.evaluate()
+
+    @staticmethod
+    def _crossed_interval(before: int, after: int, interval: int) -> bool:
+        return bool(interval and after // interval > before // interval)
 
     def evaluate(self) -> Dict[str, float]:
         """Run the ARC protocol on the internal dev split and log the result.
@@ -631,16 +1090,50 @@ class DirectorTrainer:
         torch.save(
             {
                 "agent": self.agent.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
+                "worker_optimizer": self.worker_optimizer.state_dict(),
+                "manager_optimizer": self.manager_optimizer.state_dict(),
                 "goal_optimizer": self.goal_optimizer.state_dict(),
                 "updates": self.updates,
                 "env_steps": self.env_steps,
+                "duel_rounds": self.duel_rounds,
+                "worker_explore_wins": self.worker_explore_wins,
+                "director_explore_wins": self.director_explore_wins,
+                "expl_norm": {
+                    "mean": self.expl_norm.mean,
+                    "var": self.expl_norm.var,
+                    "count": self.expl_norm.count,
+                },
                 "agent_config": asdict(self.agent.cfg),
                 "train_config": asdict(self.cfg),
                 "curriculum": source.state_dict() if hasattr(source, "state_dict") else None,
             },
             path,
         )
+
+    def _load_legacy_optimizer(self, state: Dict[str, Any]) -> None:
+        """Split a pre-duel single Adam checkpoint without losing its moments."""
+        goal_ids = {id(parameter) for parameter in self.agent.goal_ae.parameters()}
+        legacy_params = [
+            parameter
+            for parameter in self.agent.parameters()
+            if id(parameter) not in goal_ids
+        ]
+        legacy = torch.optim.Adam(legacy_params, lr=self.cfg.lr, eps=1e-5)
+        legacy.load_state_dict(state)
+
+        for target, parameters in (
+            (self.worker_optimizer, self._worker_params),
+            (self.manager_optimizer, self._manager_params),
+        ):
+            target.state.clear()
+            for parameter in parameters:
+                if parameter in legacy.state:
+                    target.state[parameter] = copy.deepcopy(legacy.state[parameter])
+            source_group = legacy.param_groups[0]
+            target_group = target.param_groups[0]
+            for key, value in source_group.items():
+                if key != "params":
+                    target_group[key] = copy.deepcopy(value)
 
     def load(self, path: Path) -> None:
         blob = torch.load(path, map_location=self.device, weights_only=False)
@@ -661,10 +1154,23 @@ class DirectorTrainer:
                 "must match."
             )
         self.agent.load_state_dict(saved)
-        self.optimizer.load_state_dict(blob["optimizer"])
+        if "worker_optimizer" in blob and "manager_optimizer" in blob:
+            self.worker_optimizer.load_state_dict(blob["worker_optimizer"])
+            self.manager_optimizer.load_state_dict(blob["manager_optimizer"])
+        elif "optimizer" in blob:
+            self._load_legacy_optimizer(blob["optimizer"])
+        else:
+            raise KeyError(f"{path} has no policy optimizer state")
         self.goal_optimizer.load_state_dict(blob["goal_optimizer"])
         self.updates = int(blob.get("updates", 0))
         self.env_steps = int(blob.get("env_steps", 0))
+        self.duel_rounds = int(blob.get("duel_rounds", 0))
+        self.worker_explore_wins = int(blob.get("worker_explore_wins", 0))
+        self.director_explore_wins = int(blob.get("director_explore_wins", 0))
+        norm = blob.get("expl_norm") or {}
+        self.expl_norm.mean = float(norm.get("mean", self.expl_norm.mean))
+        self.expl_norm.var = float(norm.get("var", self.expl_norm.var))
+        self.expl_norm.count = float(norm.get("count", self.expl_norm.count))
         source = self.env.source
         if blob.get("curriculum") and hasattr(source, "load_state_dict"):
             source.load_state_dict(blob["curriculum"])

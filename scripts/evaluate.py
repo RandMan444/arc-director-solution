@@ -1,7 +1,7 @@
 """Evaluate a checkpoint on ARC (or on generated warm-up tasks).
 
     python scripts/evaluate.py --config configs/full.yaml \
-        --checkpoint runs/full/checkpoint.pt --split evaluation --attempts 16
+        --checkpoint runs/director_proper/checkpoint.pt --split evaluation --attempts 16
 """
 
 from __future__ import annotations

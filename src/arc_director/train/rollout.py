@@ -48,6 +48,8 @@ class RolloutBuffer:
     """
 
     device: torch.device
+    worker_temperature: float = 1.0
+    manager_temperature: float = 1.0
     obs: List[Dict[str, torch.Tensor]] = field(default_factory=list)
     ops: List[torch.Tensor] = field(default_factory=list)
     args: List[torch.Tensor] = field(default_factory=list)

@@ -9,6 +9,7 @@ bootstrapping uses the right value.
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -99,3 +100,33 @@ class VecProgramEnv:
         out = dict(self.source.stats())
         out["episodes"] = self.episode_count
         return out
+
+    # -- fork/restore ----------------------------------------------------
+    def state_dict(self) -> Dict[str, Any]:
+        """Capture mutable rollout state without copying the ARC task pool.
+
+        Epiplexity candidates must begin at the exact same environment state.
+        Deep-copying this whole object would also duplicate every immutable ARC
+        task, so only each ProgramEnv's live episode is copied here.
+        """
+        skip = {"spec", "source", "cfg"}
+        return {
+            "episode_count": self.episode_count,
+            "source": copy.deepcopy(self.source.state_dict()),
+            "envs": [
+                copy.deepcopy({k: v for k, v in vars(env).items() if k not in skip})
+                for env in self.envs
+            ],
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        """Restore a state produced by :meth:`state_dict`."""
+        if len(state["envs"]) != self.n_envs:
+            raise ValueError(
+                f"environment snapshot has {len(state['envs'])} envs, expected {self.n_envs}"
+            )
+        self.source.load_state_dict(copy.deepcopy(state["source"]))
+        self.episode_count = int(state["episode_count"])
+        for env, saved in zip(self.envs, state["envs"]):
+            for key, value in copy.deepcopy(saved).items():
+                setattr(env, key, value)

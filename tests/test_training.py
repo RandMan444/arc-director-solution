@@ -12,7 +12,11 @@ from arc_director.config import build, load_config
 from arc_director.curriculum.sources import CurriculumSource
 from arc_director.curriculum.stages import DEFAULT_LADDER, Stage, group_ops, ops_mask
 from arc_director.dsl.machine import MachineSpec
-from arc_director.train.director import DirectorTrainer, RunningNorm
+from arc_director.train.director import (
+    DirectorTrainer,
+    RunningNorm,
+    epiplexity_auc,
+)
 
 CONFIG = Path(__file__).resolve().parents[1] / "configs" / "smoke.yaml"
 
@@ -30,6 +34,31 @@ def test_config_rejects_unknown_keys():
     cfg["train"]["learning_rate"] = 1e-3
     with pytest.raises(KeyError, match="learning_rate"):
         build(cfg)
+
+
+def test_director_proper_rejects_a_hybrid_worker_contract(tmp_path):
+    cfg = load_config(CONFIG)
+    cfg["train"]["director_proper"] = True
+    with pytest.raises(ValueError, match="director_proper contract violated"):
+        build(cfg, run_dir=str(tmp_path / "invalid_director"))
+
+
+def test_director_proper_is_one_step_and_worker_reward_is_goal_only(tmp_path):
+    cfg = load_config(CONFIG)
+    cfg["agent"].update(manager_every=1, worker_env_feedback=False)
+    cfg["train"].update(
+        director_proper=True,
+        worker_goal_weight=1.0,
+        worker_extrinsic_weight=0.0,
+        worker_bootstrap_across_goals=False,
+    )
+    _, _, _, trainer = build(cfg, run_dir=str(tmp_path / "proper_director"))
+    buffer = trainer.collect()
+    assert buffer.tensor("manager_active").all(), "Director must act at every step"
+    stats = trainer.update(buffer)
+    assert stats["reward/worker_mean"] == pytest.approx(
+        stats["reward/goal_mean"], abs=1e-7
+    )
 
 
 def test_config_rejects_an_encoder_too_small_for_the_ladder():
@@ -136,6 +165,38 @@ def test_checkpoint_round_trip(built, tmp_path):
         assert torch.allclose(value, after[key]), key
 
 
+def test_epiplexity_auc_is_the_sum_of_the_episode_delta_list():
+    assert epiplexity_auc([0.4, -0.1, 0.25]) == pytest.approx(0.55)
+
+
+def test_crossed_epiplexity_duel_runs_and_counts_both_forks(tmp_path):
+    cfg = load_config(CONFIG)
+    cfg["train"].update(
+        n_envs=2,
+        n_steps=4,
+        epiplexity_duel=True,
+        epiplexity_duel_updates=1,
+    )
+    _, env, agent, trainer = build(cfg, run_dir=str(tmp_path / "duel"))
+    stats, episodes = trainer.duel_update()
+
+    assert trainer.updates == 2
+    assert trainer.env_steps == 2 * 2 * 4
+    assert trainer.duel_rounds == 1
+    assert stats["epiplexity/worker_winner"] in {"explore", "exploit"}
+    assert stats["epiplexity/director_winner"] in {"explore", "exploit"}
+    for key in (
+        "epiplexity/worker_explore_auc",
+        "epiplexity/worker_exploit_auc",
+        "epiplexity/director_explore_auc",
+        "epiplexity/director_exploit_auc",
+    ):
+        assert np.isfinite(stats[key]), (key, stats[key])
+    assert isinstance(episodes, list)
+    assert all(program_env.steps == 0 for program_env in env.envs)
+    assert all(torch.isfinite(parameter).all() for parameter in agent.parameters())
+
+
 def test_running_norm_tracks_mean_and_variance():
     norm = RunningNorm()
     data = torch.randn(5000) * 3.0 + 7.0
@@ -204,6 +265,8 @@ def test_curriculum_state_round_trip():
     restored.load_state_dict(blob)
     assert restored.index == source.index
     assert restored.total_episodes == source.total_episodes
+    assert list(restored.recent) == list(source.recent)
+    assert restored.rate == source.rate
 
 
 def test_delta_goal_reward_pays_nothing_for_standing_still(built):
@@ -257,6 +320,7 @@ def test_dev_holdout_is_disjoint_and_deterministic(tmp_path):
         {"name": "arc", "kind": "arc", "arc_filter": "small", "max_steps": 6}
     ]
     cfg["agent"] = {"grid_side": 30, "mem_len": 8}
+    cfg["train"]["director_proper"] = False
 
     _, env, _, trainer = build(cfg, run_dir=str(tmp_path / "a"))
     dev_ids = {t.task_id for t in trainer.dev_tasks}

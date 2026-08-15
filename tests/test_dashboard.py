@@ -27,6 +27,9 @@ def test_dashboard_names_the_director_metrics_and_escapes_title(tmp_path):
     assert "ARC-AGI-1 exact @ 2" in page
     assert "ARC-AGI-2 exact @ 2" in page
     assert "Top operator share" in page
+    assert "Worker epiplexity duel" in page
+    assert "Director epiplexity duel" in page
+    assert "Waiting for hierarchy contract" in page
     assert "generated programs" in page.lower()
     state = json.loads((tmp_path / "dashboard.json").read_text(encoding="utf-8"))
     assert state["phase"] == "Self-generated DSL programs"

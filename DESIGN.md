@@ -309,8 +309,8 @@ already stores behaviour log-probabilities for the ratio.
 
 | Consumer | Reward |
 |---|---|
-| Worker | `1.0 · Δmax_cosine(goal, state) + 1.0 · env reward` |
-| Manager (extrinsic) | env reward, summed over the goal window |
+| Worker | `1.0 · Δmax_cosine(goal, state)` — and nothing else |
+| Manager (extrinsic) | environment/task reward |
 | Manager (exploration) | goal-autoencoder reconstruction error (novelty), normalised |
 | Environment | `2.0 · Δ(shaping accuracy) − 0.02 per step − 0.10 per error`, `+5.0` on solving every visible demonstration |
 
@@ -322,26 +322,20 @@ The environment's shaping is a difference of potentials, so the total shaping
 over an episode is `final − initial` and returning the input unchanged earns
 nothing.
 
-Two deviations from a strict Director worker, both knobs, both measured (§7):
-
-* the goal reward is the **change** in similarity, not the similarity — with
-  the absolute form the worker is paid to stand still and penalised for
-  stopping, and it never emits HALT;
-* the worker gets task reward at full weight, which is why its horizon is the
-  episode rather than the goal window. `worker_extrinsic_weight: 0.0` plus
-  `worker_bootstrap_across_goals: false` is the faithful Director pair; set
-  them together or not at all.
+The shipped configs now enforce strict Director ownership. The Director emits a
+new latent before every DSL action. The worker never receives environment
+reward in either its observation or its return; it is optimized only for making
+the one-step transition requested by that latent. Task quality is therefore
+entirely the Director's responsibility. `director_proper: true` validates these
+invariants at startup rather than allowing the old hybrid silently.
 
 ### Credit assignment across the two timescales
 
-The worker gets ordinary GAE over the episode. Director instead ends the
-worker's horizon at each goal change, on the reasoning that a worker cannot be
-blamed for what happens after its goal was replaced — which is right when the
-worker's reward is purely goal-reaching. Here it also gets task reward, and the
-solve bonus lands on the last step, so truncating would hide it from every
-statement written more than `manager_every` steps earlier.
-`worker_bootstrap_across_goals: false` restores Director's behaviour and should
-be set together with `worker_extrinsic_weight: 0.0`; the two belong together.
+Every goal lasts exactly one environment transition. A new goal terminates the
+worker's credit horizon, so its return is the immediate latent-following reward.
+The Director acts at that same frequency and receives ordinary task-return GAE;
+it alone is responsible for composing those one-step instructions into a
+successful program.
 
 The manager's transitions are `(state at goal k, code, Σ rewards over the
 window, state at goal k+1)`. Windows are ragged — an episode can end mid-window
@@ -362,32 +356,41 @@ is below 1e-4.
 
 ---
 
-## 6. Where epiplexity dueling would attach
+## 6. Crossed, per-role epiplexity dueling
 
-Left out for now, by request. The structure is already shaped for it:
+This is now implemented in `DirectorTrainer.duel_update`. Every duel episode
+forks identical agent parameters, Adam moments, recurrent state, live
+environments, curriculum state, and random-number generators. It then runs two
+crossed treatments:
 
-- The manager and the worker are separate modules with separate LSTMs,
-  separate heads and separate critics. Nothing forces them to share a
-  snapshot.
-- `DirectorTrainer.save` writes the whole agent, but `agent.manager_*` and
-  `agent.actor` / `agent.worker_*` are cleanly separable parameter groups.
-- The trainer already keeps two optimisers, so a third (or a per-branch pair)
-  is not a structural change.
+- low-temperature Director + high-temperature worker;
+- high-temperature Director + low-temperature worker.
 
-The fork Chris described — a **high-explorer manager paired with a
-low-explorer worker, against a low-explorer manager paired with a high-explorer
-worker, with separate duels per role** — needs one thing this code does not yet
-have: per-module snapshot/restore, so a duel can replace the manager's
-parameters while keeping the worker's. That is a `state_dict` split, not a
-redesign. The natural exploration knob per role is already there and already
-separate: `worker_entropy_coef` and `manager_entropy_coef`, plus
-`manager_exploration_weight` on the novelty channel, which is a *second*,
-qualitatively different explorer dial for the manager only.
+Temperature is the treatment rather than entropy-loss weight because it changes
+the first rollout from an identical fork. Each A2C chunk measures critic loss
+before and after its optimizer step on the same stored transitions and the same
+fixed return targets. The notebook semantics are preserved literally: append
+`loss_before - loss_after` to a list for each chunk, then sum that list to get
+the duel episode's epiplexity/AUC.
 
-Worth noting for that experiment: the manager's exploration reward (goal-space
-novelty) and the worker's entropy are exploration in genuinely different spaces
-— *which goals to try* versus *which statements to try*. That is exactly the
-asymmetry the duel would be measuring, so the split is well-posed.
+The two roles duel independently. The Director winner supplies
+`manager_lstm`, goal head, both manager critics, and their Adam state. The worker
+winner supplies the observation trunk, worker recurrence, memory, actor, worker
+critic, goal autoencoder, and their optimizer state. This ownership follows the
+existing gradient boundary: with `manager_grads_to_trunk: false`, only the
+worker trains the shared trunk. The configuration validator refuses the duel if
+that boundary is removed.
+
+After recombination all vector environments begin fresh episodes. That avoids
+carrying a recurrent state or partially executed DSL program produced by a
+different pairing into the hybrid winner. Both forks' environment interactions
+still count toward the step budget and throughput; the worker winner owns the
+continuing curriculum history because it owns the executed statement policy.
+
+The manager's exploration reward (goal-space novelty) and the worker's action
+temperature still operate in genuinely different spaces — *which goals to try*
+versus *which statements to try*. The dashboard exposes both AUC comparisons,
+the current winner for each role, and cumulative exploratory win rates.
 
 ---
 
@@ -419,9 +422,9 @@ nothing. With it, the halt rate went to 0.96, mean program length dropped from
 "always spend every step" to ~1-2 statements, and the solve rate reached 0.63
 (5x random) in **41k** steps rather than being flat at 300k.
 
-### A worker paid in task reward cannot have a truncated horizon
+### Historical hybrid failure: task reward leaked into the worker
 
-The run above then *collapsed*: 0.63 → 0.10 within 10k steps, worker entropy
+The old hybrid run above then *collapsed*: 0.63 → 0.10 within 10k steps, worker entropy
 2.25 → 0.78, and the policy locked onto a single operator (a 0.145 solve rate is
 exactly 1/7 — the odds of one fixed choice among seven geometry operators). It
 reproduced exactly, at the same point, with Huber value losses and a higher
@@ -437,12 +440,16 @@ symptom was the halt rate decaying (0.61 → 0.54 → 0.43 → 0.03) as the agen
 drifted from "apply the right operator, then commit" toward flailing until the
 horizon, taking the solve rate down with it.
 
-Setting `worker_bootstrap_across_goals: true` — the worker's horizon is the
+Setting `worker_bootstrap_across_goals: true` — the old worker's horizon is the
 episode — removed the collapse. The same configuration that peaked at 0.63 and
 fell to 0.10 by 56k steps now sits at 0.59–0.62 through 72k with entropy stable
 at 2.2 and no sign of the drift. A `length_bonus` was added at the same time,
 paying for the slack left on the clock when a program solves, which gives HALT
 a reason to exist beyond a 0.02 step cost.
+
+That result explains the historical hybrid but is no longer the active
+configuration. The strict one-step Director removes worker task reward rather
+than extending worker credit across Director decisions.
 
 The general lesson, and the one to carry into any Director variant: **the
 worker's reward and the worker's horizon are one decision, not two**. Mixing
@@ -498,10 +505,9 @@ ablation pair is already the "manager off / manager on" axis.
    worth ~3×; the current code re-encodes them each step for simplicity, and
    already batches the whole rollout through the trunk in one pass.
 4. **No PPO** — A2C is fine at this scale but is sample-hungrier.
-5. **Manager timescale is fixed** at `manager_every`. Director schedules goals
-   at a fixed rate too, but for program synthesis a learned or
-   variable-duration goal (end the window when the goal is reached) is a
-   natural fit.
+5. **One-step Director horizon.** This is deliberately fixed at one action per
+   latent. A learned longer abstraction can be tested later, but may not leak
+   task reward or credit directly into the worker.
 6. **Single test input.** Tasks with 2–4 test inputs currently put one in the
    machine per episode; the evaluator re-runs the selected program on each, but
    they are not jointly optimised.

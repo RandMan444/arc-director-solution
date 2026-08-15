@@ -5,7 +5,7 @@
 # scales with the square of it. Nothing about grid_side changes a parameter
 # shape, so this checkpoint loads straight into configs/full.yaml at 30.
 
-run_dir: runs/warmup_small
+run_dir: runs/director_proper_warmup
 seed: 0
 device: auto
 
@@ -46,10 +46,12 @@ agent:
   # Matches configs/full.yaml so the checkpoint transfers; the positional
   # encoding buffer is shape-bearing, so this cannot differ between the two.
   mem_len: 24
-  # Short warm-up episodes: a manager that acted every 4 steps would make a
-  # single decision per episode and get almost no credit signal.
-  manager_every: 2
+  # Director proper: a fresh latent instruction for every worker action.
+  manager_every: 1
   manager_grads_to_trunk: false
+  # Task reward belongs to the Director. The worker gets state + latent goal,
+  # never the environment's reward channel.
+  worker_env_feedback: false
   goal_groups: 8
   goal_codes: 8
 
@@ -62,8 +64,10 @@ train:
   gae_lambda: 0.95
   worker_goal_reward: delta
   worker_goal_weight: 1.0
-  worker_extrinsic_weight: 1.0
-  worker_bootstrap_across_goals: true
+  worker_extrinsic_weight: 0.0
+  # Every new one-step goal closes the previous worker transition.
+  worker_bootstrap_across_goals: false
+  director_proper: true
   # Held higher for longer than a standard A2C schedule. This action space has
   # ~60 legal operators per step, and a premature entropy collapse locks the
   # policy onto one of them for good.
@@ -71,5 +75,12 @@ train:
   worker_entropy_final: 0.010
   worker_entropy_anneal_steps: 2000000
   manager_exploration_weight: 0.1
+  # Crossed epiplexity population: low-temperature Director/high-temperature
+  # worker versus the reverse. Their critics duel independently after four
+  # same-target A2C updates, then the two winning components are recombined.
+  epiplexity_duel: true
+  epiplexity_duel_updates: 4
+  epiplexity_low_temperature: 0.75
+  epiplexity_high_temperature: 1.50
   log_every: 10
   checkpoint_every: 200
